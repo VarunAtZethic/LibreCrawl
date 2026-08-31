@@ -31,7 +31,6 @@ services:
       # any username with no password. Keep both "false" on a public domain.
       - LOCAL_MODE=${LOCAL_MODE:-false}
       - REGISTRATION_DISABLED=${REGISTRATION_DISABLED:-false}
-      - DISABLE_GUEST=${DISABLE_GUEST:-false}
       - DEMO_MODE=${DEMO_MODE:-false}
       - DANGEROUSLY_SKIP_AUTH=${DANGEROUSLY_SKIP_AUTH:-false}
 
