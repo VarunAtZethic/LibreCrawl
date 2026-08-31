@@ -16,6 +16,7 @@ services:
     environment:
       # Coolify generates a domain for this service and proxies it to port 5000.
       - SERVICE_URL_LIBRECRAWL_5000
+      - HOST_BINDING=0.0.0.0
       - FLASK_APP=main.py
       - PYTHONUNBUFFERED=1
 
@@ -35,7 +36,7 @@ services:
       - DANGEROUSLY_SKIP_AUTH=${DANGEROUSLY_SKIP_AUTH:-false}
 
       # Verification-email links point at the Coolify-assigned domain.
-      - MAIN_APP_URL=${SERVICE_URL_LIBRECRAWL_5000}
+      - MAIN_APP_URL=${SERVICE_URL_LIBRECRAWL}
       - WORKSHOP_APP_URL=${WORKSHOP_APP_URL:-https://workshop.librecrawl.com}
 
       # Email stays off until SMTP_USER and SMTP_PASSWORD are set. The defaults
