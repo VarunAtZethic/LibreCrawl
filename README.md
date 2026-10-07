@@ -10,7 +10,7 @@ A web-based multi-tenant crawler for SEO analysis and website auditing.
 
 **Browse plugins other people have built, or share your own, at the [Plugin Workshop](https://workshop.librecrawl.com)**.
 
-LibreCrawl will ***always*** be free and open source. If it's replacing your $259/year Screaming Frog license, deepcrawl license or sitebulb license, [buy me a coffee](https://www.paypal.com/donate/?business=7H9HFA3385JS8&no_recurring=0&item_name=Continue+the+development+of+LibreCrawl&currency_code=AUD).
+LibreCrawl will ***always*** be free and open source. If it's replacing your $279/year Screaming Frog license, deepcrawl license or sitebulb license, [buy me a coffee](https://www.paypal.com/donate/?business=7H9HFA3385JS8&no_recurring=0&item_name=Continue+the+development+of+LibreCrawl&currency_code=AUD).
 
 ## What it does
 
@@ -95,6 +95,20 @@ REGISTRATION_DISABLED=false
 # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
 SECRET_KEY=replace-with-a-long-random-string
 ```
+
+To add a **Login with Zoho** button, create a "Server-based Application" client at
+[api-console.zoho.com](https://api-console.zoho.com) with the redirect URI
+`https://your-host/auth/zoho/callback`, then set:
+
+```bash
+ZOHO_OAUTH_ENABLED=true
+ZOHO_CLIENT_ID=...
+ZOHO_CLIENT_SECRET=...
+ZOHO_REDIRECT_URI=https://your-host/auth/zoho/callback
+# Optional: ZOHO_ACCOUNTS_URL, ZOHO_ALLOWED_DOMAINS, ZOHO_ALLOW_SIGNUP, ZOHO_DEFAULT_TIER
+```
+
+See `.env.example` for what each option does.
 
 
 #### Option 2: Python
