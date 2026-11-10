@@ -35,8 +35,77 @@ let virtualScrollers = {
     external: null,
     internalLinks: null,
     externalLinks: null,
-    issues: null
+    issues: null,
+    extraction: null,
+    ngrams: null,
+    compare: null
 };
+
+// 'spider' follows links from one URL; 'list' checks a pasted list
+let crawlMode = 'spider';
+const MAX_LIST_URLS = 100000;
+
+// Extractor names currently shown as Custom Extraction columns
+let extractionColumns = [];
+
+// URL table column definitions. Keeping the value/sorting logic centralized
+// lets hidden columns and header sorting stay in sync with the renderers.
+const TABLE_COLUMNS = {
+    overview: [
+        { key: 'url', label: 'Address', sortable: true },
+        { key: 'status_code', label: 'Status', sortable: true },
+        { key: 'title', label: 'Title', sortable: true },
+        { key: 'meta_description', label: 'Meta Desc', sortable: true },
+        { key: 'h1', label: 'H1', sortable: true },
+        { key: 'keywords', label: 'Keywords', sortable: true },
+        { key: 'word_count', label: 'Words', sortable: true },
+        { key: 'response_time', label: 'Response (ms)', sortable: true },
+        { key: 'analytics', label: 'Analytics', sortable: true },
+        { key: 'og_tags', label: 'OG Tags', sortable: true },
+        { key: 'json_ld', label: 'JSON-LD', sortable: true },
+        { key: 'links', label: 'Links (Int/Ext)', sortable: true },
+        { key: 'images', label: 'Images', sortable: true },
+        { key: 'javascript_rendered', label: 'JS', sortable: true },
+        { key: 'indexability', label: 'Indexability', sortable: true },
+        { key: 'indexability_status', label: 'Indexability Status', sortable: true },
+        { key: 'inlinks', label: 'Inlinks', sortable: true },
+        { key: 'link_score', label: 'Link Score', sortable: true },
+        { key: 'in_sitemap', label: 'In Sitemap', sortable: true },
+        { key: 'details', label: 'Details', sortable: false }
+    ],
+    internal: [
+        { key: 'url', label: 'Address', sortable: true },
+        { key: 'status_code', label: 'Status', sortable: true },
+        { key: 'content_type', label: 'Content Type', sortable: true },
+        { key: 'size', label: 'Size', sortable: true },
+        { key: 'title', label: 'Title', sortable: true },
+        { key: 'indexability', label: 'Indexability', sortable: true },
+        { key: 'inlinks', label: 'Inlinks', sortable: true },
+        { key: 'link_score', label: 'Link Score', sortable: true }
+    ],
+    external: [
+        { key: 'url', label: 'Address', sortable: true },
+        { key: 'status_code', label: 'Status', sortable: true },
+        { key: 'content_type', label: 'Content Type', sortable: true },
+        { key: 'size', label: 'Size', sortable: true },
+        { key: 'title', label: 'Title', sortable: true }
+    ]
+};
+
+// Columns the current user has chosen to hide, and the current sort per table.
+const tableHiddenColumns = {
+    overview: new Set(),
+    internal: new Set(),
+    external: new Set()
+};
+
+const tableSortState = {
+    overview: null,
+    internal: null,
+    external: null
+};
+
+const tableColumnMenus = {};
 
 // Initialize application
 document.addEventListener('DOMContentLoaded', async function() {
@@ -52,6 +121,9 @@ async function initializeApp() {
 
     // Setup event listeners
     setupEventListeners();
+
+    // Load each user's hidden-column choices before the tables are built
+    await loadTablePreferences();
 
     // Initialize tables
     initializeTables();
@@ -94,6 +166,7 @@ async function initializeApp() {
             // Add each URL to tables
             if (data.urls && data.urls.length > 0) {
                 data.urls.forEach(url => addUrlToTable(url));
+                refreshUrlTables();
             }
 
             // Load links if present
@@ -166,8 +239,12 @@ async function initializeApp() {
         }
     }
 
-    // Set initial focus
-    document.getElementById('urlInput').focus();
+    // Restore the crawl mode picked last time in this browser
+    let savedMode = 'spider';
+    try {
+        savedMode = localStorage.getItem('librecrawl_crawl_mode') || 'spider';
+    } catch (e) { /* storage unavailable */ }
+    setCrawlMode(savedMode === 'list' ? 'list' : 'spider');
 
     console.log('LibreCrawl initialized');
 }
@@ -181,7 +258,7 @@ function setupEventListeners() {
 }
 
 function handleUrlKeypress(event) {
-    if (event.key === 'Enter' && !crawlState.isRunning) {
+    if (event.key === 'Enter' && crawlMode === 'spider' && !crawlState.isRunning) {
         toggleCrawl();
     }
 }
@@ -196,7 +273,92 @@ function toggleCrawl() {
     }
 }
 
+// ---- Crawl mode (Spider / List) ----
+
+function setCrawlMode(mode) {
+    if (crawlState.isRunning) return;
+    crawlMode = mode === 'list' ? 'list' : 'spider';
+    try {
+        localStorage.setItem('librecrawl_crawl_mode', crawlMode);
+    } catch (e) { /* storage unavailable */ }
+
+    const isList = crawlMode === 'list';
+    document.querySelectorAll('.mode-btn').forEach(btn => {
+        const active = btn.dataset.mode === crawlMode;
+        btn.classList.toggle('active', active);
+        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+    document.getElementById('urlInput').style.display = isList ? 'none' : '';
+    document.getElementById('listInputGroup').style.display = isList ? 'block' : 'none';
+
+    const label = document.getElementById('urlInputLabel');
+    label.textContent = isList ? 'URLs to Check' : 'URL to Crawl';
+    label.htmlFor = isList ? 'urlListInput' : 'urlInput';
+
+    updateListCount();
+    document.getElementById(isList ? 'urlListInput' : 'urlInput').focus();
+}
+
+// Pull URLs out of pasted text or a .txt/.csv file. Accepts one
+// URL per line or per CSV cell; header cells and other non-URL
+// tokens are skipped. Order is kept, duplicates dropped.
+function parseUrlList(text) {
+    const urls = [];
+    const seen = new Set();
+    let skipped = 0;
+    (text || '').split(/[\s,;]+/).forEach(raw => {
+        const token = raw.trim().replace(/^["']+|["']+$/g, '');
+        if (!token || token.startsWith('#')) return;
+        const looksLikeUrl = /^https?:\/\//i.test(token) ||
+            /^[^\s\/]+\.[a-z]{2,}(:\d+)?(\/|$)/i.test(token) ||
+            /^localhost(:\d+)?(\/|$)/i.test(token);
+        const url = looksLikeUrl ? normalizeUrl(token) : null;
+        if (!url || !isValidUrl(url)) {
+            skipped++;
+            return;
+        }
+        if (!seen.has(url)) {
+            seen.add(url);
+            urls.push(url);
+        }
+    });
+    return { urls, skipped };
+}
+
+function updateListCount() {
+    const countEl = document.getElementById('urlListCount');
+    if (!countEl) return;
+    const { urls, skipped } = parseUrlList(document.getElementById('urlListInput').value);
+    let text = `${urls.length.toLocaleString()} URL${urls.length === 1 ? '' : 's'}`;
+    if (skipped) text += ` (${skipped.toLocaleString()} non-URL entr${skipped === 1 ? 'y' : 'ies'} ignored)`;
+    if (urls.length > MAX_LIST_URLS) text += `, over the ${MAX_LIST_URLS.toLocaleString()} limit`;
+    countEl.textContent = text;
+    countEl.classList.toggle('list-count-over', urls.length > MAX_LIST_URLS);
+}
+
+function loadUrlListFile(event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+        const textarea = document.getElementById('urlListInput');
+        const existing = textarea.value.trim();
+        textarea.value = existing ? existing + '\n' + reader.result : reader.result;
+        updateListCount();
+        showNotification(`Loaded ${file.name}`, 'success');
+    };
+    reader.onerror = () => showNotification(`Could not read ${file.name}`, 'error');
+    reader.readAsText(file);
+    // Let the same file be picked again after edits
+    event.target.value = '';
+}
+
 function startCrawl() {
+    if (crawlMode === 'list') {
+        startListCrawl();
+        return;
+    }
+
     const urlInput = document.getElementById('urlInput');
     let url = urlInput.value.trim();
 
@@ -218,6 +380,28 @@ function startCrawl() {
     // Update the input field with the normalized URL
     urlInput.value = url;
 
+    beginCrawl(url, null);
+}
+
+function startListCrawl() {
+    const textarea = document.getElementById('urlListInput');
+    const { urls } = parseUrlList(textarea.value);
+
+    if (urls.length === 0) {
+        alert('Paste or upload at least one URL to check');
+        textarea.focus();
+        return;
+    }
+    if (urls.length > MAX_LIST_URLS) {
+        alert(`List mode accepts up to ${MAX_LIST_URLS.toLocaleString()} URLs; this list has ${urls.length.toLocaleString()}`);
+        return;
+    }
+
+    beginCrawl(urls[0], urls);
+}
+
+// Shared start sequence; urlList is null for a spider crawl
+function beginCrawl(url, urlList) {
     crawlState.isRunning = true;
     crawlState.isPaused = false;
     crawlState.startTime = new Date();
@@ -232,14 +416,14 @@ function startCrawl() {
     // Update UI
     updateCrawlButtons();
     showProgress();
-    updateStatus('Starting crawl...');
+    updateStatus(urlList ? `Starting list check of ${urlList.length.toLocaleString()} URLs...` : 'Starting crawl...');
 
     // Clear previous data
     clearAllTables();
     resetStats();
 
     // Start the actual crawling via Python backend
-    startPythonCrawl(url);
+    startPythonCrawl(url, urlList);
 }
 
 function pauseCrawl() {
@@ -344,25 +528,27 @@ function clearCrawlData() {
     document.getElementById('urlInput').focus();
 }
 
-function startPythonCrawl(url) {
+function startPythonCrawl(url, urlList) {
+    const payload = urlList ? { url: url, mode: 'list', urls: urlList } : { url: url };
+
     // Call Python backend to start crawling
     fetch('/api/start_crawl', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ url: url })
+        body: JSON.stringify(payload)
     })
     .then(response => response.json())
     .then(data => {
         if (data.success) {
-            updateStatus('Crawling in progress...');
+            updateStatus(urlList ? 'Checking listed URLs...' : 'Crawling in progress...');
             // Refresh user info to update crawl count
             loadUserInfo();
             // Start polling for updates
             pollCrawlProgress();
         } else {
-            updateStatus('Error: ' + data.error);
+            updateStatus('Error: ' + (data.error || data.message || 'could not start'));
             stopCrawl();
         }
     })
@@ -533,19 +719,27 @@ function overviewUrls() {
 // Rebuild the URL virtual scrollers from crawlState.urls, honoring the
 // active sidebar filter if one is set
 function refreshUrlTables() {
+    if (isExtractionTabActive()) {
+        refreshExtractionTable();
+    }
+
     if (crawlState.filters.active) {
         applyFilter(crawlState.filters.active);
         return;
     }
 
     if (virtualScrollers.overview) {
-        virtualScrollers.overview.setData(overviewUrls());
+        virtualScrollers.overview.setData(sortTableData(overviewUrls(), 'overview'));
     }
     if (virtualScrollers.internal) {
-        virtualScrollers.internal.setData(crawlState.urls.filter(url => url.is_internal));
+        virtualScrollers.internal.setData(
+            sortTableData(crawlState.urls.filter(url => url.is_internal), 'internal')
+        );
     }
     if (virtualScrollers.external) {
-        virtualScrollers.external.setData(crawlState.urls.filter(url => !url.is_internal));
+        virtualScrollers.external.setData(
+            sortTableData(crawlState.urls.filter(url => !url.is_internal), 'external')
+        );
     }
 }
 
@@ -607,6 +801,13 @@ function updateCrawlButtons() {
     const clearBtn = document.getElementById('clearBtn');
     const saveCrawlBtn = document.getElementById('saveCrawlBtn');
     const loadCrawlBtn = document.getElementById('loadCrawlBtn');
+
+    // The crawl mode is fixed once a crawl is under way
+    document.querySelectorAll('.mode-btn').forEach(btn => {
+        btn.disabled = crawlState.isRunning;
+    });
+    const listInput = document.getElementById('urlListInput');
+    if (listInput) listInput.readOnly = crawlState.isRunning;
 
     if (crawlState.isRunning) {
         if (crawlState.isPaused) {
@@ -717,12 +918,402 @@ function updateTimer() {
     }
 }
 
+// ------------------------------------------------------------------
+// Per-user column visibility + header sorting for the URL tables
+// ------------------------------------------------------------------
+
+const TABLE_NAMES = ['overview', 'internal', 'external'];
+
+async function loadTablePreferences() {
+    let preferences = {};
+    try {
+        const response = await fetch('/api/ui/preferences');
+        if (response.ok) {
+            const data = await response.json();
+            if (data.success && data.preferences) {
+                preferences = data.preferences;
+            }
+        }
+    } catch (error) {
+        console.warn('Could not load table column preferences:', error);
+    }
+
+    TABLE_NAMES.forEach(tableName => {
+        const entry = preferences[tableName];
+        const hidden = entry && Array.isArray(entry.hidden) ? entry.hidden : [];
+        const validKeys = new Set(TABLE_COLUMNS[tableName].map(column => column.key));
+        const hiddenSet = new Set(hidden.filter(key => validKeys.has(key)));
+
+        // Never hide every column - the table would become unusable.
+        if (hiddenSet.size === TABLE_COLUMNS[tableName].length) {
+            hiddenSet.delete(TABLE_COLUMNS[tableName][0].key);
+        }
+        tableHiddenColumns[tableName] = hiddenSet;
+    });
+}
+
+async function saveTablePreferences() {
+    const preferences = {};
+    TABLE_NAMES.forEach(tableName => {
+        preferences[tableName] = {
+            hidden: Array.from(tableHiddenColumns[tableName])
+        };
+    });
+
+    try {
+        const response = await fetch('/api/ui/preferences', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ preferences })
+        });
+        const data = await response.json();
+        if (!data.success) {
+            showNotification('Column preferences could not be saved', 'warning');
+        }
+    } catch (error) {
+        console.error('Could not save table column preferences:', error);
+        showNotification('Column preferences could not be saved', 'warning');
+    }
+}
+
+function rawOverviewValue(urlData, key) {
+    switch (key) {
+        case 'url': return urlData.url || '';
+        case 'status_code': return urlData.status_code;
+        case 'title': return urlData.title || '';
+        case 'meta_description': return urlData.meta_description || '';
+        case 'h1': return urlData.h1 || '';
+        case 'keywords': return urlData.keywords || '';
+        case 'word_count': return Number(urlData.word_count || 0);
+        case 'response_time': return Number(urlData.response_time || 0);
+        case 'analytics': return formatAnalyticsInfo(urlData.analytics || {});
+        case 'og_tags': return Object.keys(urlData.og_tags || {}).length;
+        case 'json_ld': return (urlData.json_ld || []).length;
+        case 'links': return Number(urlData.internal_links || 0) + Number(urlData.external_links || 0);
+        case 'images': return (urlData.images || []).length;
+        case 'javascript_rendered': return urlData.javascript_rendered ? 1 : 0;
+        default: return rawAnalysisValue(urlData, key);
+    }
+}
+
+// Unique inlinks. The exact count arrives with the end-of-crawl analysis;
+// until then the live linked_from length is a close stand-in (O(1), as
+// this runs inside sort comparators).
+function inlinkCount(urlData) {
+    if (typeof urlData.inlinks === 'number') return urlData.inlinks;
+    if (!urlData.is_internal) return null;
+    return (urlData.linked_from || []).length;
+}
+
+// Columns shared by the Overview and Internal tables
+function rawAnalysisValue(urlData, key) {
+    switch (key) {
+        case 'indexability': return urlData.indexability || '';
+        case 'indexability_status': return urlData.indexability_status || '';
+        case 'inlinks': return inlinkCount(urlData);
+        case 'link_score': return typeof urlData.link_score === 'number' ? urlData.link_score : null;
+        case 'in_sitemap':
+            if (urlData.in_sitemap === true) return 'Yes';
+            if (urlData.in_sitemap === false) return 'No';
+            return '';
+        default: return '';
+    }
+}
+
+function rawUrlValue(urlData, key) {
+    switch (key) {
+        case 'url': return urlData.url || '';
+        case 'status_code': return urlData.status_code;
+        case 'content_type': return urlData.content_type || '';
+        case 'size': return Number(urlData.size || 0);
+        case 'title': return urlData.title || '';
+        default: return rawAnalysisValue(urlData, key);
+    }
+}
+
+function rawColumnValue(tableName, urlData, key) {
+    if (tableName === 'overview') {
+        return rawOverviewValue(urlData, key);
+    }
+    return rawUrlValue(urlData, key);
+}
+
+function displayColumnValue(tableName, urlData, key) {
+    const raw = rawColumnValue(tableName, urlData, key);
+
+    if (tableName === 'overview') {
+        if (key === 'meta_description') {
+            return raw.length > 50 ? raw.substring(0, 50) + '...' : raw;
+        }
+        if (key === 'og_tags') return raw ? `${raw} tags` : '';
+        if (key === 'json_ld') return raw ? `${raw} scripts` : '';
+        if (key === 'links') {
+            return `${urlData.internal_links || 0}/${urlData.external_links || 0}`;
+        }
+        if (key === 'images') return raw ? `${raw} images` : '';
+        if (key === 'javascript_rendered') return raw ? '✅ JS' : '';
+    }
+
+    if (raw === null || raw === undefined) return '';
+    return String(raw);
+}
+
+function sortTableData(data, tableName) {
+    const sort = tableSortState[tableName];
+    if (!sort) return data;
+
+    const column = TABLE_COLUMNS[tableName].find(c => c.key === sort.key);
+    if (!column || !column.sortable) return data;
+
+    const direction = sort.direction === 'desc' ? -1 : 1;
+
+    return data.slice().sort((a, b) => {
+        const aValue = rawColumnValue(tableName, a, sort.key);
+        const bValue = rawColumnValue(tableName, b, sort.key);
+
+        if (aValue == null && bValue == null) {
+            return String(a.url || '').localeCompare(String(b.url || '')) * direction;
+        }
+        if (aValue == null) return 1;
+        if (bValue == null) return -1;
+
+        let result;
+        if (typeof aValue === 'number' && typeof bValue === 'number') {
+            result = aValue - bValue;
+        } else {
+            result = String(aValue).localeCompare(String(bValue), undefined, { sensitivity: 'base' });
+        }
+
+        if (result === 0) {
+            result = String(a.url || '').localeCompare(String(b.url || ''));
+        }
+        return result * direction;
+    });
+}
+
+function setupTableHeader(tableName) {
+    const table = document.getElementById(`${tableName}Table`);
+    if (!table) return;
+
+    const headers = table.querySelectorAll('thead th');
+    headers.forEach((th, index) => {
+        const column = TABLE_COLUMNS[tableName][index];
+        if (!column) return;
+
+        th.dataset.col = column.key;
+
+        if (column.sortable) {
+            th.classList.add('sortable');
+            th.addEventListener('click', event => {
+                if (event.target.classList.contains('column-resize-grip')) return;
+                handleTableSort(tableName, column.key);
+            });
+
+            const indicator = document.createElement('span');
+            indicator.className = 'sort-indicator';
+            indicator.setAttribute('aria-hidden', 'true');
+            th.appendChild(indicator);
+        }
+
+        if (tableHiddenColumns[tableName].has(column.key)) {
+            th.classList.add('column-hidden');
+        }
+    });
+}
+
+function createTableColumnToolbar(tableName) {
+    const pane = document.getElementById(`${tableName}-tab`);
+    if (!pane) return;
+
+    const container = pane.querySelector('.table-container');
+    if (!container) return;
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'table-toolbar';
+
+    const row = document.createElement('div');
+    row.className = 'table-toolbar-row';
+
+    const left = document.createElement('div');
+    left.className = 'table-toolbar-left';
+
+    const columnsButton = document.createElement('button');
+    columnsButton.type = 'button';
+    columnsButton.className = 'column-toggle-btn';
+    columnsButton.setAttribute('aria-haspopup', 'true');
+    columnsButton.setAttribute('aria-expanded', 'false');
+    columnsButton.innerHTML =
+        '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">' +
+        '<rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5"/><path d="M6 2.75v10.5M10 2.75v10.5"/></svg>' +
+        '<span>Columns</span>' +
+        '<svg class="caret" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true">' +
+        '<path d="M4.5 6.5 8 10l3.5-3.5"/></svg>';
+
+    const hint = document.createElement('span');
+    hint.className = 'table-toolbar-hint';
+    hint.textContent = 'Click a column header to sort ascending/descending';
+
+    const menu = document.createElement('div');
+    menu.className = 'column-menu';
+    menu.hidden = true;
+
+    left.appendChild(columnsButton);
+    left.appendChild(menu);
+    row.appendChild(left);
+    row.appendChild(hint);
+
+    TABLE_COLUMNS[tableName].forEach(column => {
+        const label = document.createElement('label');
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.dataset.col = column.key;
+        checkbox.checked = !tableHiddenColumns[tableName].has(column.key);
+
+        checkbox.addEventListener('change', () => {
+            if (checkbox.checked) {
+                tableHiddenColumns[tableName].delete(column.key);
+            } else {
+                tableHiddenColumns[tableName].add(column.key);
+            }
+
+            // Keep at least one visible column.
+            if (tableHiddenColumns[tableName].size === TABLE_COLUMNS[tableName].length) {
+                tableHiddenColumns[tableName].delete(column.key);
+                checkbox.checked = true;
+            }
+
+            applyColumnVisibility(tableName);
+            saveTablePreferences();
+        });
+
+        label.appendChild(checkbox);
+        label.appendChild(document.createTextNode(' ' + column.label));
+        menu.appendChild(label);
+    });
+
+    const resetButton = document.createElement('button');
+    resetButton.type = 'button';
+    resetButton.className = 'column-menu-reset';
+    resetButton.textContent = 'Show all columns';
+    resetButton.addEventListener('click', () => {
+        tableHiddenColumns[tableName].clear();
+        menu.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            cb.checked = true;
+        });
+        applyColumnVisibility(tableName);
+        saveTablePreferences();
+    });
+    menu.appendChild(resetButton);
+
+    const setMenuOpen = open => {
+        menu.hidden = !open;
+        columnsButton.setAttribute('aria-expanded', String(open));
+    };
+
+    columnsButton.addEventListener('click', () => {
+        setMenuOpen(menu.hidden);
+    });
+
+    // Close the dropdown on outside click or Escape.
+    document.addEventListener('click', event => {
+        if (!menu.hidden && !left.contains(event.target)) setMenuOpen(false);
+    });
+    document.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && !menu.hidden) setMenuOpen(false);
+    });
+
+    toolbar.appendChild(row);
+    pane.insertBefore(toolbar, container);
+    tableColumnMenus[tableName] = menu;
+}
+
+function setupTableColumnControls() {
+    TABLE_NAMES.forEach(tableName => {
+        setupTableHeader(tableName);
+        createTableColumnToolbar(tableName);
+    });
+
+    TABLE_NAMES.forEach(tableName => {
+        applyColumnVisibility(tableName);
+    });
+}
+
+function applyColumnVisibility(tableName) {
+    const table = document.getElementById(`${tableName}Table`);
+    if (!table) return;
+
+    const hidden = tableHiddenColumns[tableName];
+
+    table.querySelectorAll('thead th[data-col]').forEach(th => {
+        th.classList.toggle('column-hidden', hidden.has(th.dataset.col));
+    });
+
+    table.querySelectorAll('tbody td[data-col]').forEach(cell => {
+        cell.classList.toggle('column-hidden', hidden.has(cell.dataset.col));
+    });
+
+    updateScrollerColumnCount(tableName);
+}
+
+function updateScrollerColumnCount(tableName) {
+    const scroller = virtualScrollers[tableName];
+    if (!scroller) return;
+
+    const visibleCount = TABLE_COLUMNS[tableName].filter(
+        column => !tableHiddenColumns[tableName].has(column.key)
+    ).length || 1;
+
+    if (scroller.topSpacer && scroller.topSpacer.firstChild) {
+        scroller.topSpacer.firstChild.colSpan = visibleCount;
+    }
+    if (scroller.bottomSpacer && scroller.bottomSpacer.firstChild) {
+        scroller.bottomSpacer.firstChild.colSpan = visibleCount;
+    }
+}
+
+function handleTableSort(tableName, key) {
+    const column = TABLE_COLUMNS[tableName].find(c => c.key === key);
+    if (!column || !column.sortable) return;
+
+    const current = tableSortState[tableName];
+    if (current && current.key === key) {
+        tableSortState[tableName] = {
+            key,
+            direction: current.direction === 'asc' ? 'desc' : 'asc'
+        };
+    } else {
+        tableSortState[tableName] = { key, direction: 'asc' };
+    }
+
+    updateSortIndicators(tableName);
+    refreshUrlTables();
+}
+
+function updateSortIndicators(tableName) {
+    const table = document.getElementById(`${tableName}Table`);
+    if (!table) return;
+
+    const sort = tableSortState[tableName];
+    table.querySelectorAll('thead th').forEach(th => {
+        const indicator = th.querySelector('.sort-indicator');
+        if (!indicator) return;
+
+        const active = sort && sort.key === th.dataset.col;
+        indicator.textContent = active
+            ? (sort.direction === 'asc' ? ' ↑' : ' ↓')
+            : '';
+        th.classList.toggle('sorted', active);
+    });
+}
+
 // Table Management
 function initializeTables() {
     // Clear any existing data first
     clearAllTables();
     // Initialize virtual scrollers for all tables
     initializeVirtualScrollers();
+    // Attach column controls and sorting to the URL tables
+    setupTableColumnControls();
     // Initialize column resizers after virtual scrollers
     setTimeout(() => {
         if (window.initializeColumnResizers) {
@@ -788,6 +1379,37 @@ function initializeVirtualScrollers() {
             console.log('External links virtual scroller initialized');
         }
 
+        // Custom extraction table (columns follow the extractors)
+        const extractionContainer = document.querySelector('#extraction-tab .table-container');
+        if (extractionContainer && extractionContainer.querySelector('tbody')) {
+            virtualScrollers.extraction = new VirtualScroller(extractionContainer, {
+                rowHeight: 60,
+                buffer: 25,
+                renderRow: renderExtractionRow
+            });
+        }
+
+        // N-grams table
+        const ngramsContainer = document.querySelector('#ngrams-tab .table-container');
+        if (ngramsContainer && ngramsContainer.querySelector('tbody')) {
+            virtualScrollers.ngrams = new VirtualScroller(ngramsContainer, {
+                rowHeight: 60,
+                buffer: 25,
+                renderRow: renderNgramRow
+            });
+            console.log('N-grams virtual scroller initialized');
+        }
+
+        // Crawl comparison table
+        const compareContainer = document.querySelector('#compare-tab .table-container');
+        if (compareContainer && compareContainer.querySelector('tbody')) {
+            virtualScrollers.compare = new VirtualScroller(compareContainer, {
+                rowHeight: 60,
+                buffer: 25,
+                renderRow: renderCompareRow
+            });
+        }
+
         // Issues table
         const issuesContainer = document.querySelector('#issues-tab .table-container');
         if (issuesContainer && issuesContainer.querySelector('tbody')) {
@@ -806,6 +1428,397 @@ function initializeVirtualScrollers() {
 function isLinksTabActive() {
     const linksTab = document.getElementById('links-tab');
     return linksTab && linksTab.classList.contains('active');
+}
+
+function isExtractionTabActive() {
+    const tab = document.getElementById('extraction-tab');
+    return tab && tab.classList.contains('active');
+}
+
+// Rows with extraction results; the table only redraws while its
+// tab is showing, and catches up when the tab is opened
+function refreshExtractionTable() {
+    const scroller = virtualScrollers.extraction;
+    if (!scroller) return;
+
+    const rows = crawlState.urls.filter(u => u.custom_extraction);
+    const names = [];
+    const seen = new Set();
+    rows.forEach(u => Object.keys(u.custom_extraction).forEach(name => {
+        if (!seen.has(name)) {
+            seen.add(name);
+            names.push(name);
+        }
+    }));
+
+    if (names.join('\u0000') !== extractionColumns.join('\u0000')) {
+        extractionColumns = names;
+        rebuildExtractionHeader();
+    }
+
+    const empty = document.getElementById('extractionEmpty');
+    if (empty) empty.style.display = rows.length ? 'none' : 'block';
+    scroller.setData(rows);
+}
+
+function rebuildExtractionHeader() {
+    const headerRow = document.getElementById('extractionHeaderRow');
+    if (!headerRow) return;
+    headerRow.innerHTML = '';
+    ['Address', 'Status', ...extractionColumns].forEach(label => {
+        const th = document.createElement('th');
+        th.textContent = label;
+        headerRow.appendChild(th);
+    });
+
+    // Spacer rows span the whole table
+    const scroller = virtualScrollers.extraction;
+    if (scroller) {
+        scroller.topSpacer.firstChild.colSpan = extractionColumns.length + 2;
+        scroller.bottomSpacer.firstChild.colSpan = extractionColumns.length + 2;
+    }
+    if (window.ColumnResizer) {
+        new ColumnResizer(document.getElementById('extractionTable'));
+    }
+}
+
+function renderExtractionRow(row, urlData) {
+    const status = urlData.status_code ||
+        getStatusCodeText(0, urlData.error_type);
+    row.appendChild(makeTextCell(urlData.url, 'break-all'));
+    row.appendChild(makeTextCell(status));
+
+    const extracted = urlData.custom_extraction || {};
+    extractionColumns.forEach(name => {
+        const values = extracted[name] || [];
+        const full = values.join(' | ');
+        const shown = full.length > 300 ? full.substring(0, 300) + '…' : full;
+        const cell = makeTextCell(shown, 'break-word');
+        if (shown !== full) cell.title = full;
+        if (values.length > 1) cell.dataset.count = values.length;
+        row.appendChild(cell);
+    });
+}
+
+// TIL: Its n-gram not engram. Thanks Cyberpunk
+// N-gram analysis
+let ngramRows = [];
+
+function isNgramsTabActive() {
+    const tab = document.getElementById('ngrams-tab');
+    return tab && tab.classList.contains('active');
+}
+
+async function loadNgrams() {
+    const sizeSelect = document.getElementById('ngramSize');
+    const urlFilter = document.getElementById('ngramUrlFilter');
+    const statusEl = document.getElementById('ngramStatus');
+    const n = sizeSelect ? parseInt(sizeSelect.value, 10) : 1;
+    const activeFilter = crawlState.filters.active;
+
+    statusEl.textContent = 'Analyzing…';
+    const params = new URLSearchParams({ n: String(n) });
+    if (activeFilter) {
+        params.set('filter', activeFilter);
+    }
+    if (urlFilter && urlFilter.value.trim()) {
+        params.set('url', urlFilter.value.trim());
+    }
+
+    try {
+        const response = await fetch('/api/ngrams?' + params.toString());
+        const data = await response.json();
+        if (!data.success) {
+            statusEl.textContent = data.error || 'N-gram analysis failed';
+            return;
+        }
+        ngramRows = data.ngrams || [];
+        statusEl.textContent = `${data.url_count} URL(s), ${ngramRows.length} n-gram(s)`
+            + (activeFilter ? ` [filter: ${activeFilter}]` : '');
+        renderNgrams(ngramRows);
+    } catch (error) {
+        statusEl.textContent = 'N-gram analysis failed';
+    }
+}
+
+function renderNgrams(rows) {
+    const scroller = virtualScrollers.ngrams;
+    const empty = document.getElementById('ngramsEmptyState');
+    if (!scroller) return;
+
+    if (!rows.length) {
+        empty.style.display = 'block';
+        scroller.setData([]);
+        return;
+    }
+    empty.style.display = 'none';
+    scroller.setData(rows);
+}
+
+function renderNgramRow(row, ngram) {
+    row.appendChild(makeTextCell(ngram.gram, 'break-word'));
+    row.appendChild(makeTextCell(ngram.body));
+    row.appendChild(makeTextCell(ngram.density + '%'));
+    row.appendChild(makeTextCell(ngram.body_unlinked));
+    row.appendChild(makeTextCell(ngram.headings));
+    row.appendChild(makeTextCell(ngram.title));
+    row.appendChild(makeTextCell(ngram.inlinks_anchor));
+    row.appendChild(makeTextCell(ngram.inlinks_alt));
+    row.appendChild(makeTextCell(ngram.total));
+}
+
+function filterNgrams() {
+    const query = document.getElementById('ngramSearch').value.trim().toLowerCase();
+    renderNgrams(query ? ngramRows.filter(r => r.gram.toLowerCase().includes(query)) : ngramRows);
+}
+
+function exportNgrams() {
+    if (!ngramRows.length) return;
+    const headers = ['gram', 'body', 'density', 'body_unlinked', 'headings', 'title', 'inlinks_anchor', 'inlinks_alt', 'total', 'url_count'];
+    const lines = [headers.join(',')];
+    ngramRows.forEach(row => {
+        lines.push(headers.map(key => {
+            const value = row[key] === undefined ? '' : String(row[key]);
+            return '"' + value.replace(/"/g, '""') + '"';
+        }).join(','));
+    });
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'ngrams.csv';
+    link.click();
+    URL.revokeObjectURL(link.href);
+}
+
+// ========================================
+// Crawl comparison
+// ========================================
+let compareResult = null;
+let compareKindFilter = 'all';
+let compareLabels = {};
+const compareState = { currentId: null, previousId: null };
+
+async function loadCompareOptions() {
+    const select = document.getElementById('compareCrawlSelect');
+    const statusEl = document.getElementById('compareStatus');
+    if (!select) return;
+
+    try {
+        const [statusResponse, listResponse] = await Promise.all([
+            fetch('/api/crawl_status?stats_only=1'),
+            fetch('/api/crawls/list?limit=200')
+        ]);
+        const status = await statusResponse.json();
+        const list = await listResponse.json();
+        const currentId = status.crawl_id;
+        compareState.currentId = currentId;
+
+        if (!list.success) {
+            statusEl.textContent = list.error || 'Could not load saved crawls';
+            return;
+        }
+
+        const current = (list.crawls || []).find(c => c.id === currentId);
+        const currentDomain = current ? current.base_domain : null;
+        const others = (list.crawls || []).filter(c => c.id !== currentId);
+        // Same site first, newest first within each group (the list is
+        // already newest first)
+        others.sort((a, b) => (b.base_domain === currentDomain) - (a.base_domain === currentDomain));
+
+        const previous = select.value;
+        select.innerHTML = '';
+        if (!currentId) {
+            statusEl.textContent = 'Run or load a crawl first; it becomes the "current" side.';
+        } else if (!others.length) {
+            statusEl.textContent = 'No other saved crawls to compare with yet.';
+        } else {
+            statusEl.textContent = '';
+        }
+        others.forEach(c => {
+            const option = document.createElement('option');
+            option.value = c.id;
+            const when = c.started_at ? String(c.started_at).replace('T', ' ').slice(0, 16) : '';
+            option.textContent = `#${c.id} ${c.base_url} · ${when} · ${c.urls_crawled || 0} URLs` +
+                (c.status && c.status !== 'completed' ? ` (${c.status})` : '');
+            select.appendChild(option);
+        });
+        if (previous && others.some(c => String(c.id) === previous)) {
+            select.value = previous;
+        }
+    } catch (error) {
+        statusEl.textContent = 'Could not load saved crawls';
+    }
+}
+
+async function runCompare() {
+    const select = document.getElementById('compareCrawlSelect');
+    const statusEl = document.getElementById('compareStatus');
+    if (!select || !select.value) {
+        statusEl.textContent = 'Pick a crawl to compare with.';
+        return;
+    }
+
+    statusEl.textContent = 'Comparing…';
+    const params = new URLSearchParams({ previous: select.value });
+    try {
+        const response = await fetch('/api/crawls/compare?' + params.toString());
+        const data = await response.json();
+        if (!data.success) {
+            statusEl.textContent = data.error || 'Comparison failed';
+            return;
+        }
+        compareResult = data;
+        compareLabels = {};
+        data.change_kinds.forEach(kind => { compareLabels[kind.key] = kind.label; });
+        compareState.previousId = data.previous.id;
+        compareState.currentId = data.current.id;
+        compareKindFilter = 'all';
+
+        const filter = document.getElementById('compareChangeFilter');
+        filter.innerHTML = '<option value="all">All changes</option>';
+        data.change_kinds.forEach(kind => {
+            const option = document.createElement('option');
+            option.value = kind.key;
+            option.textContent = `${kind.label} (${data.summary.changes[kind.key] || 0})`;
+            filter.appendChild(option);
+        });
+
+        statusEl.textContent = `#${data.previous.id} → #${data.current.id}: ` +
+            `${data.total_changes.toLocaleString()} change(s)` +
+            (data.truncated ? ` (showing the first ${data.changes.length.toLocaleString()}; export CSV for all)` : '');
+        renderCompareSummary(data);
+        filterCompareChanges();
+    } catch (error) {
+        statusEl.textContent = 'Comparison failed';
+    }
+}
+
+function renderCompareSummary(data) {
+    const container = document.getElementById('compareSummary');
+    container.innerHTML = '';
+
+    const cards = document.createElement('div');
+    cards.className = 'compare-cards';
+
+    const totals = document.createElement('div');
+    totals.className = 'compare-card';
+    totals.style.cursor = 'default';
+    const strong = document.createElement('strong');
+    strong.textContent = `${data.summary.previous_urls.toLocaleString()} → ${data.summary.current_urls.toLocaleString()}`;
+    totals.appendChild(strong);
+    totals.appendChild(document.createTextNode('URLs'));
+    cards.appendChild(totals);
+
+    data.change_kinds.forEach(kind => {
+        const count = data.summary.changes[kind.key] || 0;
+        const card = document.createElement('button');
+        card.type = 'button';
+        card.className = 'compare-card' + (count ? '' : ' zero');
+        card.dataset.kind = kind.key;
+        const value = document.createElement('strong');
+        value.textContent = count.toLocaleString();
+        card.appendChild(value);
+        card.appendChild(document.createTextNode(kind.label));
+        card.addEventListener('click', () => {
+            const filter = document.getElementById('compareChangeFilter');
+            filter.value = filter.value === kind.key ? 'all' : kind.key;
+            filterCompareChanges();
+        });
+        cards.appendChild(card);
+    });
+    container.appendChild(cards);
+
+    // Only issue types whose count moved; unchanged ones are noise here
+    const movedIssues = (data.issue_changes || []).filter(change => change.delta !== 0);
+    if (movedIssues.length) {
+        const wrap = document.createElement('div');
+        wrap.className = 'compare-issues';
+        const table = document.createElement('table');
+        const head = table.createTHead().insertRow();
+        ['Issue', 'Type', 'Previous', 'Current', 'Change'].forEach(label => {
+            const th = document.createElement('th');
+            th.textContent = label;
+            head.appendChild(th);
+        });
+        const body = table.createTBody();
+        movedIssues.forEach(change => {
+            const row = body.insertRow();
+            [change.issue, change.type, change.previous, change.current].forEach(value => {
+                row.insertCell().textContent = value;
+            });
+            const delta = row.insertCell();
+            delta.textContent = change.delta > 0 ? `+${change.delta}` : String(change.delta);
+            if (change.delta > 0) delta.className = 'compare-delta-up';
+            else if (change.delta < 0) delta.className = 'compare-delta-down';
+        });
+        wrap.appendChild(table);
+        container.appendChild(wrap);
+    }
+}
+
+function filterCompareChanges() {
+    const scroller = virtualScrollers.compare;
+    const empty = document.getElementById('compareEmptyState');
+    if (!scroller) return;
+    if (!compareResult) {
+        scroller.setData([]);
+        return;
+    }
+
+    compareKindFilter = document.getElementById('compareChangeFilter').value;
+    const query = document.getElementById('compareSearch').value.trim().toLowerCase();
+
+    let rows = compareResult.changes;
+    if (compareKindFilter !== 'all') {
+        rows = rows.filter(c => c.change === compareKindFilter);
+    }
+    if (query) {
+        rows = rows.filter(c =>
+            c.url.toLowerCase().includes(query) ||
+            String(c.previous).toLowerCase().includes(query) ||
+            String(c.current).toLowerCase().includes(query));
+    }
+
+    document.querySelectorAll('#compareSummary .compare-card[data-kind]').forEach(card => {
+        card.classList.toggle('active', card.dataset.kind === compareKindFilter);
+    });
+
+    if (empty) {
+        empty.style.display = rows.length ? 'none' : 'flex';
+        const title = empty.querySelector('h3');
+        const text = empty.querySelector('p');
+        if (title) title.textContent = 'No Changes';
+        if (text) text.textContent = compareResult.total_changes
+            ? 'Nothing matches the current filter.'
+            : 'These two crawls match on every compared field.';
+    }
+    scroller.setData(rows);
+}
+
+function exportCompareCsv() {
+    if (!compareState.previousId || !compareState.currentId) {
+        showNotification('Run a comparison first', 'warning');
+        return;
+    }
+    const params = new URLSearchParams({
+        previous: compareState.previousId,
+        current: compareState.currentId,
+        format: 'csv'
+    });
+    window.location.href = '/api/crawls/compare?' + params.toString();
+}
+
+function renderCompareRow(row, change) {
+    const urlCell = makeTextCell(change.url, 'break-all');
+    urlCell.title = change.url;
+    row.appendChild(urlCell);
+    row.appendChild(makeTextCell(compareLabels[change.change] || change.change));
+    const previous = makeTextCell(change.previous, 'break-word');
+    previous.title = change.previous;
+    row.appendChild(previous);
+    const current = makeTextCell(change.current, 'break-word');
+    current.title = change.current;
+    row.appendChild(current);
 }
 
 function isIssuesTabActive() {
@@ -1016,6 +2029,33 @@ function clearAllTables() {
     if (virtualScrollers.issues) {
         virtualScrollers.issues.clear();
     }
+    if (virtualScrollers.extraction) {
+        virtualScrollers.extraction.clear();
+    }
+    if (extractionColumns.length) {
+        extractionColumns = [];
+        rebuildExtractionHeader();
+    }
+    const extractionEmpty = document.getElementById('extractionEmpty');
+    if (extractionEmpty) extractionEmpty.style.display = 'block';
+
+    ngramRows = [];
+    if (virtualScrollers.ngrams) {
+        virtualScrollers.ngrams.clear();
+    }
+
+    // A new crawl changes the "current" side, so a shown diff is stale
+    compareResult = null;
+    compareState.previousId = null;
+    if (virtualScrollers.compare) {
+        virtualScrollers.compare.clear();
+    }
+    const compareSummary = document.getElementById('compareSummary');
+    if (compareSummary) compareSummary.innerHTML = '';
+    const compareStatus = document.getElementById('compareStatus');
+    if (compareStatus) compareStatus.textContent = '';
+    const ngramEmpty = document.getElementById('ngramsEmptyState');
+    if (ngramEmpty) ngramEmpty.style.display = 'block';
 
     // Clear status codes table (not virtualized)
     const statusCodesBody = document.getElementById('statusCodesTableBody');
@@ -1093,6 +2133,18 @@ function switchTab(tabName) {
     if (tabName === 'links' && crawlState.pendingLinks) {
         updateLinksTable(crawlState.pendingLinks);
         crawlState.pendingLinks = null; // Clear pending data
+    }
+
+    if (tabName === 'extraction') {
+        refreshExtractionTable();
+    }
+
+    if (tabName === 'ngrams') {
+        loadNgrams();
+    }
+
+    if (tabName === 'compare') {
+        loadCompareOptions();
     }
 
     // Load pending issues data if switching to Issues tab
@@ -1220,6 +2272,10 @@ function applyFilter(filterType) {
     // Update Status Codes table with filtered data
     updateStatusCodesTable(filterType);
 
+    if (isNgramsTabActive()) {
+        loadNgrams();
+    }
+
     console.log('Applied filter:', filterType);
 }
 
@@ -1228,19 +2284,23 @@ function clearActiveFilters() {
 
     // Reset all virtual scrollers to show full data
     if (virtualScrollers.overview) {
-        virtualScrollers.overview.setData(overviewUrls());
+        virtualScrollers.overview.setData(sortTableData(overviewUrls(), 'overview'));
     }
     if (virtualScrollers.internal) {
         const internalUrls = crawlState.urls.filter(url => url.is_internal);
-        virtualScrollers.internal.setData(internalUrls);
+        virtualScrollers.internal.setData(sortTableData(internalUrls, 'internal'));
     }
     if (virtualScrollers.external) {
         const externalUrls = crawlState.urls.filter(url => !url.is_internal);
-        virtualScrollers.external.setData(externalUrls);
+        virtualScrollers.external.setData(sortTableData(externalUrls, 'external'));
     }
 
     // Reset Status Codes table to show all data
     updateStatusCodesTable();
+
+    if (isNgramsTabActive()) {
+        loadNgrams();
+    }
 }
 
 function filterVirtualScrollerData(scrollerName, filterType) {
@@ -1285,13 +2345,17 @@ function filterVirtualScrollerData(scrollerName, filterType) {
                     return (url.content_type || '').toLowerCase().includes('javascript');
                 case 'images':
                     return (url.content_type || '').toLowerCase().includes('image');
+                case 'indexable':
+                    return url.indexability === 'Indexable';
+                case 'non_indexable':
+                    return url.indexability === 'Non-Indexable';
                 default:
                     return true;
             }
         });
     }
 
-    scroller.setData(filteredData);
+    scroller.setData(sortTableData(filteredData, scrollerName));
 }
 
 // Legacy function - kept for compatibility but no longer used
@@ -1339,7 +2403,9 @@ function updateFilterCounts() {
         html: 0,
         css: 0,
         js: 0,
-        images: 0
+        images: 0,
+        indexable: 0,
+        non_indexable: 0
     };
 
     crawlState.urls.forEach(url => {
@@ -1364,6 +2430,9 @@ function updateFilterCounts() {
         else if (contentType.includes('css')) counts.css++;
         else if (contentType.includes('javascript')) counts.js++;
         else if (contentType.includes('image')) counts.images++;
+
+        if (url.indexability === 'Indexable') counts.indexable++;
+        else if (url.indexability === 'Non-Indexable') counts.non_indexable++;
     });
 
     // Update DOM
@@ -1421,6 +2490,10 @@ function updateStatusCodesTable(filterType = null) {
         filteredUrls = filteredUrls.filter(url => (url.content_type || '').includes('javascript'));
     } else if (filterType === 'images') {
         filteredUrls = filteredUrls.filter(url => (url.content_type || '').includes('image'));
+    } else if (filterType === 'indexable') {
+        filteredUrls = filteredUrls.filter(url => url.indexability === 'Indexable');
+    } else if (filterType === 'non_indexable') {
+        filteredUrls = filteredUrls.filter(url => url.indexability === 'Non-Indexable');
     }
 
     let totalUrls = filteredUrls.length;
@@ -1485,6 +2558,7 @@ function getStatusCodeText(statusCode, errorType) {
             case 'ssl_error':           return 'SSL/TLS Error';
             case 'connection_error':    return 'Connection Error';
             case 'file_too_large':      return 'Skipped (file too large)';
+            case 'blocked_by_robots':   return 'Blocked by robots.txt';
             default:                    return 'No Response';
         }
     } else {
@@ -1646,7 +2720,10 @@ async function exportData() {
         // Determine which data types to export based on settings
         const hasIssues = exportFields.includes('issues_detected');
         const hasLinks = exportFields.includes('links_detailed');
-        const regularFields = exportFields.filter(f => f !== 'issues_detected' && f !== 'links_detailed');
+        const hasNgrams = exportFields.includes('ngrams');
+        const regularFields = exportFields.filter(
+            f => f !== 'issues_detected' && f !== 'links_detailed' && f !== 'ngrams'
+        );
 
         // Use streaming endpoint — downloads directly, no memory blow-up
         const downloads = [];
@@ -1673,6 +2750,17 @@ async function exportData() {
                 format: exportFormat,
                 type: 'issues'
             });
+            downloads.push('/api/export_stream?' + params.toString());
+        }
+
+        if (hasNgrams) {
+            const params = new URLSearchParams({
+                format: exportFormat,
+                type: 'ngrams'
+            });
+            if (crawlState.filters.active) {
+                params.set('filter', crawlState.filters.active);
+            }
             downloads.push('/api/export_stream?' + params.toString());
         }
 
@@ -1829,7 +2917,39 @@ function showUrlDetails(url) {
                                 <div><strong>Charset:</strong> ${safeCharset}</div>
                                 <div><strong>Canonical URL:</strong> ${safeCanonical}</div>
                                 <div><strong>Robots Meta:</strong> ${safeRobots}</div>
+                                ${urlData.h1_count > 1 ? `<div><strong>H1 Count:</strong> ${urlData.h1_count}</div>` : ''}
+                                ${urlData.title_count > 1 ? `<div><strong>Title Tags:</strong> ${urlData.title_count}</div>` : ''}
+                                ${urlData.canonical_header ? `<div><strong>Canonical (Link header):</strong> ${escapeHtml(urlData.canonical_header)}</div>` : ''}
                             </div>
+                            ${urlData.canonical_count > 1 ? `
+                                <div class="details-subsection">
+                                    <h5>${urlData.canonical_count} canonical declarations:</h5>
+                                    ${(urlData.canonicals || []).map(href =>
+                                        `<div style="word-break: break-all;">${escapeHtml(href) || '<span style="color:#9ca3af">(empty href)</span>'}</div>`
+                                    ).join('')}
+                                </div>
+                            ` : ''}
+                        </div>
+
+                        <div class="details-section">
+                            <h4>🧭 Indexability</h4>
+                            <div class="details-grid">
+                                <div><strong>Indexability:</strong> ${escapeHtml(urlData.indexability) || 'N/A'}${urlData.indexability_status ? ' (' + escapeHtml(urlData.indexability_status) + ')' : ''}</div>
+                                <div><strong>X-Robots-Tag:</strong> ${escapeHtml(urlData.x_robots_tag) || 'N/A'}</div>
+                                <div><strong>Unique Inlinks:</strong> ${inlinkCount(urlData) ?? 'N/A'}</div>
+                                <div><strong>Internal Outlinks:</strong> ${typeof urlData.outlinks === 'number' ? urlData.outlinks : 'N/A'}</div>
+                                <div><strong>Link Score:</strong> ${typeof urlData.link_score === 'number' ? urlData.link_score + ' / 100' : 'N/A'}</div>
+                                <div><strong>In Sitemap:</strong> ${urlData.in_sitemap === true ? 'Yes' : urlData.in_sitemap === false ? 'No' : 'No sitemap found'}</div>
+                            </div>
+                            ${(urlData.redirects && urlData.redirects.length) ? `
+                                <div class="details-subsection">
+                                    <h5>Redirect chain (${urlData.redirects.length} hop${urlData.redirects.length !== 1 ? 's' : ''}):</h5>
+                                    ${urlData.redirects.map(hop =>
+                                        `<div style="word-break: break-all;">${escapeHtml(String(hop.status_code || '3xx'))} ${escapeHtml(hop.url)}</div>`
+                                    ).join('')}
+                                    <div style="word-break: break-all;">→ ${escapeHtml(urlData.redirected_to || '')} (${escapeHtml(String(urlData.status_code))})</div>
+                                </div>
+                            ` : ''}
                         </div>
 
                         <div class="details-section">
@@ -1891,6 +3011,19 @@ function showUrlDetails(url) {
                                 ${urlData.error ? `<div><strong>Error:</strong> ${escapeHtml(urlData.error)}</div>` : ''}
                             </div>
                         </div>
+
+                        ${urlData.custom_extraction && Object.keys(urlData.custom_extraction).length ? `
+                        <div class="details-section">
+                            <h4>🧩 Custom Extraction</h4>
+                            <div class="details-grid">
+                                ${Object.entries(urlData.custom_extraction).map(([name, values]) => `
+                                    <div><strong>${escapeHtml(name)}:</strong> ${(values && values.length)
+                                        ? values.map(v => `<span class="extract-value">${escapeHtml(v)}</span>`).join(' ')
+                                        : '<span style="color:#9ca3af">no match</span>'}</div>
+                                `).join('')}
+                            </div>
+                        </div>
+                        ` : ''}
 
                         ${(urlData.linked_from && urlData.linked_from.length > 0) ? `
                         <div class="details-section">
@@ -2459,74 +3592,48 @@ function loadCrawl() {
 // ========================================
 
 function renderOverviewRow(row, urlData, index) {
-    const analyticsInfo = formatAnalyticsInfo(urlData.analytics || {});
-    const ogTagsCount = Object.keys(urlData.og_tags || {}).length;
-    const jsonLdCount = (urlData.json_ld || []).length;
-    const linksInfo = `${urlData.internal_links || 0}/${urlData.external_links || 0}`;
-    const imagesCount = (urlData.images || []).length;
-    const jsRendered = urlData.javascript_rendered ? '✅ JS' : '';
-
-    const keywordsInfo = urlData.keywords || '';
-
-    const cells = [
-        urlData.url,
-        urlData.status_code,
-        urlData.title || '',
-        (urlData.meta_description || '').substring(0, 50) + (urlData.meta_description && urlData.meta_description.length > 50 ? '...' : ''),
-        urlData.h1 || '',
-        keywordsInfo,
-        urlData.word_count || 0,
-        urlData.response_time || 0,
-        analyticsInfo,
-        ogTagsCount > 0 ? `${ogTagsCount} tags` : '',
-        jsonLdCount > 0 ? `${jsonLdCount} scripts` : '',
-        linksInfo,
-        imagesCount > 0 ? `${imagesCount} images` : '',
-        jsRendered,
-        `<button class="details-btn" onclick="showUrlDetails('${urlData.url.replace(/'/g, "\\'")}')">📊 Details</button>`
-    ];
-
-    cells.forEach(cellData => {
+    TABLE_COLUMNS.overview.forEach(column => {
         const cell = document.createElement('td');
-        if (typeof cellData === 'string' && cellData.includes('<button')) {
-            cell.innerHTML = cellData;
-        } else {
-            cell.textContent = cellData;
+        cell.dataset.col = column.key;
+
+        if (tableHiddenColumns.overview.has(column.key)) {
+            cell.classList.add('column-hidden');
         }
+
+        if (column.key === 'details') {
+            const button = document.createElement('button');
+            button.className = 'details-btn';
+            button.textContent = '📊 Details';
+            button.addEventListener('click', () => showUrlDetails(urlData.url));
+            cell.appendChild(button);
+        } else {
+            cell.textContent = displayColumnValue('overview', urlData, column.key);
+        }
+
+        row.appendChild(cell);
+    });
+}
+
+function renderUrlRow(row, urlData, tableName) {
+    TABLE_COLUMNS[tableName].forEach(column => {
+        const cell = document.createElement('td');
+        cell.dataset.col = column.key;
+
+        if (tableHiddenColumns[tableName].has(column.key)) {
+            cell.classList.add('column-hidden');
+        }
+
+        cell.textContent = displayColumnValue(tableName, urlData, column.key);
         row.appendChild(cell);
     });
 }
 
 function renderInternalRow(row, urlData, index) {
-    const cells = [
-        urlData.url,
-        urlData.status_code,
-        urlData.content_type || '',
-        urlData.size || 0,
-        urlData.title || ''
-    ];
-
-    cells.forEach(cellData => {
-        const cell = document.createElement('td');
-        cell.textContent = cellData;
-        row.appendChild(cell);
-    });
+    renderUrlRow(row, urlData, 'internal');
 }
 
 function renderExternalRow(row, urlData, index) {
-    const cells = [
-        urlData.url,
-        urlData.status_code,
-        urlData.content_type || '',
-        urlData.size || 0,
-        urlData.title || ''
-    ];
-
-    cells.forEach(cellData => {
-        const cell = document.createElement('td');
-        cell.textContent = cellData;
-        row.appendChild(cell);
-    });
+    renderUrlRow(row, urlData, 'external');
 }
 
 // Build a <td> with text set via textContent so crawled-page content

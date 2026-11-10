@@ -32,7 +32,15 @@
         <section class="url-section">
             <div class="url-container">
                 <div class="input-group">
-                    <label for="urlInput" class="input-label">URL to Crawl</label>
+                    <div class="input-label-row">
+                        <label for="urlInput" class="input-label" id="urlInputLabel">URL to Crawl</label>
+                        <div class="mode-toggle" role="group" aria-label="Crawl mode">
+                            <button type="button" class="mode-btn active" data-mode="spider" onclick="setCrawlMode('spider')"
+                                    title="Start from one URL and follow its links">Spider</button>
+                            <button type="button" class="mode-btn" data-mode="list" onclick="setCrawlMode('list')"
+                                    title="Check exactly the URLs you paste or upload, without following links">List</button>
+                        </div>
+                    </div>
                     <input
                         type="url"
                         id="urlInput"
@@ -40,6 +48,18 @@
                         placeholder="https://example.com"
                         onkeypress="handleUrlKeypress(event)"
                     >
+                    <div id="listInputGroup" class="list-input-group" style="display: none;">
+                        <textarea id="urlListInput" class="url-input url-list-input" rows="5" spellcheck="false"
+                                  placeholder="Paste URLs, one per line&#10;https://example.com/&#10;https://example.com/pricing"
+                                  oninput="updateListCount()"></textarea>
+                        <div class="list-input-footer">
+                            <span id="urlListCount" class="list-count">0 URLs</span>
+                            <label class="btn btn-secondary btn-small list-upload-btn">
+                                Upload .txt / .csv
+                                <input type="file" id="urlListFile" accept=".txt,.csv,text/plain,text/csv" onchange="loadUrlListFile(event)" hidden>
+                            </label>
+                        </div>
+                    </div>
                 </div>
                 <div class="control-buttons">
                     <button id="startBtn" class="btn btn-primary" onclick="toggleCrawl()">
@@ -135,6 +155,20 @@
                                 </div>
                             </div>
                         </div>
+
+                        <div class="filter-group">
+                            <div class="filter-header">Indexability</div>
+                            <div class="filter-subgroup">
+                                <div class="filter-item" onclick="toggleFilter('indexable')" title="Internal URLs that return 200 with no noindex and a self-referencing (or no) canonical">
+                                    <span class="filter-name">Indexable</span>
+                                    <span class="filter-count" id="indexable-count">0</span>
+                                </div>
+                                <div class="filter-item" onclick="toggleFilter('non_indexable')" title="Redirected, error, blocked by robots.txt, noindex (meta or X-Robots-Tag) or canonicalised">
+                                    <span class="filter-name">Non-Indexable</span>
+                                    <span class="filter-count" id="non_indexable-count">0</span>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -193,6 +227,9 @@
                         <button class="tab-btn" onclick="switchTab('status-codes')">Status Codes</button>
                         <button class="tab-btn" onclick="switchTab('links')">Links</button>
                         <button class="tab-btn" onclick="switchTab('issues')">Issues</button>
+                        <button class="tab-btn" onclick="switchTab('extraction')">Custom Extraction</button>
+                        <button class="tab-btn" onclick="switchTab('ngrams')">N-Grams</button>
+                        <button class="tab-btn" onclick="switchTab('compare')">Compare</button>
                         <button class="tab-btn" onclick="switchTab('pagespeed')">PageSpeed</button>
                         <button class="tab-btn" onclick="switchTab('visualization')">Visualization</button>
                     </div>
@@ -217,6 +254,11 @@
                                             <th>Links (Int/Ext)</th>
                                             <th>Images</th>
                                             <th>JS</th>
+                                            <th>Indexability</th>
+                                            <th>Indexability Status</th>
+                                            <th>Inlinks</th>
+                                            <th>Link Score</th>
+                                            <th>In Sitemap</th>
                                             <th>Details</th>
                                         </tr>
                                     </thead>
@@ -237,6 +279,9 @@
                                             <th>Content Type</th>
                                             <th>Size</th>
                                             <th>Title</th>
+                                            <th>Indexability</th>
+                                            <th>Inlinks</th>
+                                            <th>Link Score</th>
                                         </tr>
                                     </thead>
                                     <tbody id="internalTableBody">
@@ -398,6 +443,111 @@
                             </div>
                         </div>
 
+                        <div id="extraction-tab" class="tab-pane">
+                            <div id="extractionEmpty" class="extraction-empty">
+                                No custom extraction data yet. Add CSS selector or XPath rules under
+                                <strong>Settings &rsaquo; Extraction</strong>, then start a crawl.
+                            </div>
+                            <div class="table-container">
+                                <table class="data-table" id="extractionTable">
+                                    <thead>
+                                        <tr id="extractionHeaderRow">
+                                            <th>Address</th>
+                                            <th>Status</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="extractionTableBody">
+                                        <!-- Data will be populated here -->
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        <div id="ngrams-tab" class="tab-pane">
+                            <div class="filter-bar" style="margin-bottom: 15px; display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; align-items: center;">
+                                <label style="color: #cbd5e1; font-size: 14px;">
+                                    N-gram size
+                                    <select id="ngramSize" onchange="loadNgrams()" style="padding: 6px 10px; border-radius: 6px; border: 1px solid #4b5563; background: #1f2937; color: white;">
+                                        <option value="1">1</option>
+                                        <option value="2">2</option>
+                                        <option value="3">3</option>
+                                        <option value="4">4</option>
+                                        <option value="5">5</option>
+                                        <option value="6">6</option>
+                                    </select>
+                                </label>
+                                <input id="ngramUrlFilter" type="text" placeholder="Filter by exact URL (optional)" style="padding: 6px 12px; border-radius: 6px; border: 1px solid #4b5563; background: #1f2937; color: white; font-size: 13px; min-width: 300px;">
+                                <input id="ngramSearch" type="text" placeholder="Search n-gram" oninput="filterNgrams()" style="padding: 6px 12px; border-radius: 6px; border: 1px solid #4b5563; background: #1f2937; color: white; font-size: 13px;">
+                                <button onclick="loadNgrams()" style="padding: 8px 16px; border-radius: 6px; border: 1px solid #4b5563; background: #374151; color: white; cursor: pointer; font-size: 14px;">Analyze</button>
+                                <button onclick="exportNgrams()" style="padding: 8px 16px; border-radius: 6px; border: 1px solid #4b5563; background: #1f2937; color: white; cursor: pointer; font-size: 14px;">Export CSV</button>
+                                <span id="ngramStatus" style="color: #94a3b8; font-size: 13px;"></span>
+                            </div>
+                            <div class="table-container">
+                                <table class="data-table" id="ngramsTable">
+                                    <thead>
+                                        <tr>
+                                            <th>N-gram</th>
+                                            <th>Body Text</th>
+                                            <th>Density</th>
+                                            <th>Body Text (Unlinked)</th>
+                                            <th>Headings</th>
+                                            <th>Title</th>
+                                            <th>Inlinks Anchor Text</th>
+                                            <th>Inlinks Alt Text</th>
+                                            <th>Total</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="ngramsTableBody">
+                                        <!-- Data will be populated here -->
+                                    </tbody>
+                                </table>
+                                <div class="empty-state" id="ngramsEmptyState" style="display: none;">
+                                    <div class="empty-state-content">
+                                        <h3>No N-grams Found</h3>
+                                        <p>Start a crawl with HTML pages, then analyze body text, headings, titles, and inlink anchor text.</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="compare-tab" class="tab-pane">
+                            <div class="filter-bar compare-bar">
+                                <label class="compare-label">
+                                    Compare the current crawl with
+                                    <select id="compareCrawlSelect" class="compare-input"></select>
+                                </label>
+                                <button class="compare-btn compare-btn-primary" onclick="runCompare()">Compare</button>
+                                <select id="compareChangeFilter" class="compare-input" onchange="filterCompareChanges()">
+                                    <option value="all">All changes</option>
+                                </select>
+                                <input id="compareSearch" class="compare-input" type="text" placeholder="Search URL or value" oninput="filterCompareChanges()">
+                                <button class="compare-btn" onclick="exportCompareCsv()">Export CSV</button>
+                                <span id="compareStatus" class="compare-status"></span>
+                            </div>
+                            <div id="compareSummary" class="compare-summary"></div>
+                            <div class="table-container">
+                                <table class="data-table" id="compareTable">
+                                    <thead>
+                                        <tr>
+                                            <th style="width: 40%;">URL</th>
+                                            <th style="width: 16%;">Change</th>
+                                            <th style="width: 22%;">Previous</th>
+                                            <th style="width: 22%;">Current</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="compareTableBody">
+                                        <!-- Changes will be populated here -->
+                                    </tbody>
+                                </table>
+                                <div class="empty-state" id="compareEmptyState">
+                                    <div class="empty-state-content">
+                                        <h3>Compare Crawls</h3>
+                                        <p>Pick an earlier crawl of this site to see new and removed URLs, status, indexability, title, meta and H1 changes, and issues that appeared or were fixed.</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
                         <div id="pagespeed-tab" class="tab-pane">
                             <div class="pagespeed-container">
                                 <div class="pagespeed-header">
@@ -519,6 +669,7 @@
                     <button class="settings-tab-btn" onclick="switchSettingsTab('filters')">Filters</button>
                     <button class="settings-tab-btn" onclick="switchSettingsTab('export')">Export</button>
                     <button class="settings-tab-btn" onclick="switchSettingsTab('javascript')">JavaScript</button>
+                    <button class="settings-tab-btn" onclick="switchSettingsTab('extraction')">Extraction</button>
                     <button class="settings-tab-btn" onclick="switchSettingsTab('issues')">Issue Exclusion</button>
                     <button class="settings-tab-btn" onclick="switchSettingsTab('customcss')">Custom CSS</button>
                     <button class="settings-tab-btn" onclick="switchSettingsTab('advanced')">Advanced</button>
@@ -799,8 +950,48 @@
                                 Robots Meta
                             </label>
                             <label class="checkbox-label">
+                                <input type="checkbox" name="exportFields" value="x_robots_tag">
+                                X-Robots-Tag Header
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" name="exportFields" value="indexability">
+                                Indexability
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" name="exportFields" value="indexability_status">
+                                Indexability Status
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" name="exportFields" value="inlinks">
+                                Unique Inlinks
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" name="exportFields" value="outlinks">
+                                Unique Internal Outlinks
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" name="exportFields" value="link_score">
+                                Link Score
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" name="exportFields" value="in_sitemap">
+                                In Sitemap
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" name="exportFields" value="h1_count">
+                                H1 Count
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" name="exportFields" value="custom_extraction">
+                                Custom Extraction (one column per extractor)
+                            </label>
+                            <label class="checkbox-label">
                                 <input type="checkbox" name="exportFields" value="issues_detected">
                                 Issues Detected (separate export)
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" name="exportFields" value="ngrams">
+                                N-Grams (separate export)
                             </label>
                         </div>
                     </div>
@@ -874,6 +1065,34 @@
                         <div style="background: rgba(251, 191, 36, 0.1); border: 1px solid rgba(251, 191, 36, 0.3); border-radius: 6px; padding: 12px; color: #fbbf24;">
                             <strong>⚠️ Performance Impact</strong><br>
                             JavaScript rendering is significantly slower than HTTP-only crawling. Use for sites with dynamic content or when static crawling produces incomplete results.
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Custom Extraction Settings -->
+                <div id="extraction-settings" class="settings-tab-content">
+                    <h3>Custom Extraction</h3>
+                    <p class="setting-help">Pull any value out of every crawled HTML page with a CSS selector or an XPath expression: prices, SKUs, authors, publish dates, schema fields, tracking IDs. Each extractor becomes a column in the Custom Extraction tab and in exports.</p>
+
+                    <div class="setting-group">
+                        <div class="extractor-head">
+                            <span>Name</span><span>Type</span><span>Selector / expression</span><span>Extract</span><span>Attribute</span><span></span>
+                        </div>
+                        <div id="extractorRows" class="extractor-rows"></div>
+                        <div class="extractor-actions">
+                            <button type="button" class="btn btn-secondary btn-small" onclick="addExtractorRow()">+ Add extractor</button>
+                            <span id="extractorError" class="extractor-error" role="alert"></span>
+                        </div>
+                    </div>
+
+                    <div class="setting-group">
+                        <div style="background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.3); border-radius: 6px; padding: 12px; line-height: 1.7;">
+                            <strong>Examples</strong><br>
+                            CSS <code>.product-price</code> with <em>Text</em> reads the visible price<br>
+                            CSS <code>link[rel=alternate]</code> with <em>Attribute</em> <code>hreflang</code> lists hreflang codes<br>
+                            XPath <code>//meta[@property='article:published_time']/@content</code> reads a publish date<br>
+                            XPath <code>count(//a[contains(@href,'/product/')])</code> counts product links<br>
+                            Selectors run on the raw HTML, or on the rendered DOM when JavaScript rendering is on. Up to 50 matches per extractor are kept.
                         </div>
                     </div>
                 </div>

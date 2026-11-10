@@ -9,21 +9,35 @@ import argparse
 import secrets
 import string
 import os
+import re
+import sys
 import base64
 from io import StringIO, BytesIO
 from datetime import datetime, timedelta
+
+# UTF-8 output everywhere: Windows writes redirected output in cp1252, which can't encode the log's emoji
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+# Load .env before importing src modules: several of them (email_service's
+# SMTP settings, for one) read environment variables at import time.
+from dotenv import load_dotenv
+load_dotenv()
+
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 from flask_compress import Compress
 from functools import wraps
 from src.crawler import WebCrawler
+from src.core.ngram_analyzer import NgramAnalyzer
 from src.settings_manager import SettingsManager
-from src.auth_db import init_db, create_user, authenticate_user, get_user_by_id, log_guest_crawl, get_guest_crawls_last_24h, verify_user, set_user_tier, create_verification_token, verify_token, get_user_by_email, get_or_create_zoho_user
-from src.email_service import send_verification_email, send_welcome_email
-from src.zoho_oauth import ZohoOAuthConfig, ZohoOAuthError
 
-# Load environment variables from .env file
-from dotenv import load_dotenv
-load_dotenv()
+NGRAM_EXPORT_FIELDS = [
+    'gram', 'body', 'density', 'body_unlinked', 'headings',
+    'title', 'inlinks_anchor', 'inlinks_alt', 'total', 'url_count'
+]
+from src.auth_db import init_db, create_user, authenticate_user, get_user_by_id, log_guest_crawl, get_guest_crawls_last_24h, verify_user, set_user_tier, create_verification_token, verify_token, get_user_by_email, get_or_create_zoho_user, get_user_settings, save_user_settings, claim_first_admin
+from src.email_service import send_verification_email, send_welcome_email, is_email_configured
+from src.zoho_oauth import ZohoOAuthConfig, ZohoOAuthError
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='LibreCrawl - SEO Spider Tool')
@@ -183,6 +197,18 @@ if DISABLE_GUEST:
     print("Guest login is not allowed")
     print("=" * 60)
 
+if not LOCAL_MODE and not SKIP_AUTH and not is_email_configured():
+    from src.auth_db import has_admin
+    print("=" * 60)
+    print("EMAIL NOT CONFIGURED (no SMTP_USER / SMTP_PASSWORD)")
+    print("Accounts can't be verified by email.")
+    if has_admin():
+        print("New accounts need approval: python manage.py approve <username>")
+    else:
+        print("No admin account yet: the first account to register (or an")
+        print("existing unverified account logging in) becomes the admin.")
+    print("=" * 60)
+
 if DEMO_MODE:
     print("=" * 60)
     print("DEMO MODE ENABLED")
@@ -326,6 +352,46 @@ def start_cleanup_thread():
     cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
     cleanup_thread.start()
     print("Started crawler instance cleanup thread")
+
+def flatten_custom_extraction(urls, fields, join=True):
+    """Expand the custom_extraction export field into one column per
+    extractor, named extract_<name>, in the order the rules ran.
+
+    Returns (rows, fields). Rows are shallow per-row dicts holding only
+    the exported fields. Multiple matches are joined with " | " unless
+    ``join`` is False (JSON keeps them as a list).
+    """
+    if 'custom_extraction' not in fields:
+        return urls, fields
+
+    names = []
+    for url_data in urls:
+        for name in (url_data.get('custom_extraction') or {}):
+            if name not in names:
+                names.append(name)
+
+    columns = {}
+    for name in names:
+        slug = re.sub(r'[^0-9A-Za-z]+', '_', name).strip('_').lower() or 'field'
+        key, n = f'extract_{slug}', 2
+        while key in columns.values() or key in fields:
+            key, n = f'extract_{slug}_{n}', n + 1
+        columns[name] = key
+
+    at = fields.index('custom_extraction')
+    plain = [f for f in fields if f != 'custom_extraction']
+    new_fields = fields[:at] + list(columns.values()) + fields[at + 1:]
+
+    def row(url_data):
+        out = {f: url_data.get(f, '') for f in plain}
+        extracted = url_data.get('custom_extraction') or {}
+        for name, key in columns.items():
+            values = extracted.get(name) or []
+            out[key] = ' | '.join(values) if join else values
+        return out
+
+    return [row(u) for u in urls], new_fields
+
 
 def generate_csv_export(urls, fields):
     """Generate CSV export content"""
@@ -647,6 +713,16 @@ def register():
             print(f"Error during local mode auto-verification: {e}")
             # Don't fail the registration, just log the error
             # The account is still created successfully
+    elif success and not is_email_configured():
+        # No SMTP: nobody can verify by email. The first account on the
+        # instance is its owner and becomes admin; anyone after that needs the
+        # admin to approve them (python manage.py approve <username>).
+        if claim_first_admin(user_id):
+            print(f"Email is not configured: '{username}' is the first account and is now the admin of this instance")
+            message = 'Account created! As the first account on this server, you are its admin. You can log in now.'
+        else:
+            message = ("Account created, but this server can't send verification emails, "
+                       "so whoever runs it needs to approve your account before you can log in.")
     elif success:
         # Not in local mode - send verification email
         is_resend = (message == 'resend')
@@ -690,7 +766,8 @@ def login():
         success, message = skip_auth_login(username)
         return jsonify({'success': success, 'message': message})
 
-    success, message, user_data = authenticate_user(username, password)
+    success, message, user_data = authenticate_user(username, password,
+                                                    email_configured=is_email_configured())
 
     if success:
         session['user_id'] = user_data['id']
@@ -752,6 +829,65 @@ def user_info():
         }
     })
 
+# ------------------------------------------------------------------
+# Per-user table view preferences (hidden columns in Overview/Internal/External)
+# ------------------------------------------------------------------
+UI_TABLES = ('overview', 'internal', 'external')
+
+def sanitize_table_preferences(preferences):
+    """Keep only known table names and string column keys."""
+    clean = {}
+    if not isinstance(preferences, dict):
+        return clean
+    for table in UI_TABLES:
+        entry = preferences.get(table)
+        if not isinstance(entry, dict):
+            continue
+        hidden = entry.get('hidden')
+        if not isinstance(hidden, list):
+            continue
+        clean[table] = {
+            'hidden': [str(key) for key in hidden if isinstance(key, str)]
+        }
+    return clean
+
+@app.route('/api/ui/preferences')
+@login_required
+def get_ui_preferences():
+    """Return the current user's table column preferences."""
+    user_id = session.get('user_id')
+    if user_id:
+        saved = get_user_settings(user_id) or {}
+        preferences = saved.get('uiPreferences', {})
+    else:
+        preferences = session.get('uiPreferences', {})
+    return jsonify({
+        'success': True,
+        'preferences': sanitize_table_preferences(preferences)
+    })
+
+@app.route('/api/ui/preferences', methods=['POST'])
+@login_required
+def save_ui_preferences():
+    """Persist the current user's table column preferences."""
+    data = request.get_json(silent=True) or {}
+    preferences = sanitize_table_preferences(data.get('preferences', data))
+
+    user_id = session.get('user_id')
+    if user_id:
+        saved = get_user_settings(user_id) or {}
+        saved['uiPreferences'] = preferences
+        success, message = save_user_settings(user_id, saved)
+        if not success:
+            return jsonify({'success': False, 'error': message}), 500
+    else:
+        session['uiPreferences'] = preferences
+
+    return jsonify({
+        'success': True,
+        'preferences': preferences
+    })
+
 @app.route('/')
 def index():
     # In local mode, auto-login if not already logged in
@@ -781,6 +917,14 @@ def start_crawl():
 
     data = request.get_json()
     url = data.get('url')
+
+    # List mode: crawl exactly these URLs, follow no links
+    url_list = None
+    if data.get('mode') == 'list':
+        url_list = data.get('urls')
+        if not isinstance(url_list, list) or len(url_list) == 0:
+            return jsonify({'success': False, 'error': 'List mode needs at least one URL'})
+        url = url or str(url_list[0])
 
     if not url:
         return jsonify({'success': False, 'error': 'URL is required'})
@@ -822,7 +966,8 @@ def start_crawl():
         crawler.config['demo_memory_limit_bytes'] = int(1.5 * 1024 * 1024 * 1024)  # 1.5GB
 
     # Pass user_id and session_id for database persistence
-    success, message = crawler.start_crawl(url, user_id=user_id, session_id=session_id)
+    success, message = crawler.start_crawl(url, user_id=user_id, session_id=session_id,
+                                           url_list=url_list)
 
     # Store crawl_id in session
     if success and crawler.crawl_id:
@@ -830,7 +975,12 @@ def start_crawl():
         # Also log to old crawl_history for compatibility
         log_crawl_start(user_id, url)
 
-    return jsonify({'success': success, 'message': message, 'crawl_id': crawler.crawl_id})
+    response = {'success': success, 'message': message, 'crawl_id': crawler.crawl_id}
+    if not success:
+        response['error'] = message
+    elif url_list is not None:
+        response['list_count'] = crawler.stats['discovered']
+    return jsonify(response)
 
 @app.route('/api/stop_crawl', methods=['POST'])
 @login_required
@@ -989,6 +1139,73 @@ def visualization_data():
             'nodes': [],
             'edges': []
         })
+
+def filter_crawl_urls(urls, filter_type):
+    """Apply the left-side URL filters to n-gram analysis."""
+    if not filter_type:
+        return urls
+    result = []
+    for u in urls:
+        status = u.get('status_code')
+        content_type = (u.get('content_type') or '').lower()
+        if filter_type == 'internal':
+            keep = u.get('is_internal')
+        elif filter_type == 'external':
+            keep = not u.get('is_internal')
+        elif filter_type == '2xx':
+            keep = status is not None and 200 <= status < 300
+        elif filter_type == '3xx':
+            keep = status is not None and 300 <= status < 400
+        elif filter_type == '4xx':
+            keep = status is not None and 400 <= status < 500
+        elif filter_type == '5xx':
+            keep = status is not None and status >= 500
+        elif filter_type == 'no_response':
+            keep = status in (0, None) and u.get('error_type') != 'file_too_large'
+        elif filter_type == 'html':
+            keep = 'html' in content_type
+        elif filter_type == 'css':
+            keep = 'css' in content_type
+        elif filter_type == 'js':
+            keep = 'javascript' in content_type
+        elif filter_type == 'images':
+            keep = 'image' in content_type
+        elif filter_type == 'indexable':
+            keep = u.get('indexability') == 'Indexable'
+        elif filter_type == 'non_indexable':
+            keep = u.get('indexability') == 'Non-Indexable'
+        else:
+            keep = True
+        if keep:
+            result.append(u)
+    return result
+
+@app.route('/api/ngrams')
+@login_required
+def get_ngrams():
+    """Aggregate n-gram frequency across crawled pages and inlinks."""
+    try:
+        crawler = get_or_create_crawler()
+        n = request.args.get('n', 1, type=int)
+        url_filter = request.args.get('url', '').strip()
+        filter_type = request.args.get('filter', '').strip()
+
+        urls = filter_crawl_urls(crawler.crawl_results, filter_type)
+        selected = [u['url'] for u in urls if not url_filter or u.get('url') == url_filter]
+        links = crawler.link_manager.all_links if crawler.link_manager else []
+
+        rows = NgramAnalyzer().aggregate(urls, links, selected, n)
+        return jsonify({
+            'success': True,
+            'n': max(1, min(6, n)),
+            'url_count': len(selected),
+            'ngrams': rows
+        })
+    except Exception as e:
+        print(f"Error generating n-grams: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/debug/memory')
 @login_required
@@ -1331,6 +1548,101 @@ def crawl_stats():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
+COMPARE_MAX_ROWS = 50000
+
+def _can_access_crawl(crawl):
+    """Owners see their crawls; a guest only the crawls of its own session."""
+    if not crawl:
+        return False
+    user_id = session.get('user_id')
+    if user_id:
+        return crawl.get('user_id') == user_id
+    return crawl.get('session_id') == session.get('session_id')
+
+@app.route('/api/crawls/compare')
+@login_required
+def compare_crawls_endpoint():
+    """Diff two saved crawls: ?previous=<id>&current=<id>.
+
+    current defaults to the crawl loaded in this session. format=csv streams
+    every change; JSON returns the summary plus up to COMPARE_MAX_ROWS rows.
+    """
+    from flask import Response
+    from src.crawl_db import get_crawl_by_id, load_compare_rows, load_issue_names
+    from src.core.crawl_compare import compare_crawls, CHANGE_KINDS
+
+    try:
+        previous_id = request.args.get('previous', type=int)
+        current_id = request.args.get('current', type=int)
+        if current_id is None:
+            current_id = get_or_create_crawler().crawl_id
+        if not previous_id or not current_id:
+            return jsonify({'success': False,
+                            'error': 'Pick a saved crawl to compare against the current one'}), 400
+        if previous_id == current_id:
+            return jsonify({'success': False, 'error': 'Pick two different crawls'}), 400
+
+        previous, current = get_crawl_by_id(previous_id), get_crawl_by_id(current_id)
+        if not previous or not current:
+            return jsonify({'success': False, 'error': 'Crawl not found'}), 404
+        if not _can_access_crawl(previous) or not _can_access_crawl(current):
+            return jsonify({'success': False, 'error': 'Unauthorized'}), 403
+
+        # Issues hidden by the exclusion patterns stay hidden here too
+        exclusion_patterns = get_exclusion_patterns(get_session_settings())
+
+        def issues_for(crawl_id):
+            issues = load_issue_names(crawl_id)
+            if not exclusion_patterns:
+                return issues
+            return [i for i in issues
+                    if not issue_matches_exclusion({'url': i[0]}, exclusion_patterns)]
+
+        diff = compare_crawls(load_compare_rows(previous_id), load_compare_rows(current_id),
+                              issues_for(previous_id), issues_for(current_id))
+
+        def describe(crawl):
+            return {'id': crawl['id'], 'base_url': crawl.get('base_url'),
+                    'started_at': crawl.get('started_at'), 'status': crawl.get('status'),
+                    'urls_crawled': crawl.get('urls_crawled')}
+
+        if request.args.get('format') == 'csv':
+            labels = dict(CHANGE_KINDS)
+
+            def generate():
+                out = StringIO()
+                writer = csv.writer(out)
+                writer.writerow(['url', 'change', 'previous', 'current'])
+                for change in diff['changes']:
+                    writer.writerow([change['url'], labels.get(change['change'], change['change']),
+                                     change['previous'], change['current']])
+                    if out.tell() > 65536:
+                        yield out.getvalue()
+                        out.seek(0)
+                        out.truncate()
+                yield out.getvalue()
+
+            filename = f'librecrawl_compare_{previous_id}_vs_{current_id}.csv'
+            return Response(generate(), mimetype='text/csv',
+                            headers={'Content-Disposition': f'attachment; filename={filename}'})
+
+        changes = diff['changes']
+        return jsonify({
+            'success': True,
+            'previous': describe(previous),
+            'current': describe(current),
+            'summary': diff['summary'],
+            'issue_changes': diff['issue_changes'],
+            'change_kinds': [{'key': k, 'label': label} for k, label in CHANGE_KINDS],
+            'changes': changes[:COMPARE_MAX_ROWS],
+            'truncated': len(changes) > COMPARE_MAX_ROWS,
+            'total_changes': len(changes),
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/api/export_stream')
 @login_required
 def export_stream():
@@ -1419,6 +1731,57 @@ def export_stream():
                     headers={'Content-Disposition': f'attachment; filename=librecrawl_issues_{timestamp}.csv'}
                 )
 
+        elif data_type == 'ngrams':
+            n = request.args.get('n', 1, type=int)
+            filter_type = request.args.get('filter', '').strip()
+            url_filter = request.args.get('url', '').strip()
+            urls = filter_crawl_urls(crawler.crawl_results, filter_type)
+            selected = [u['url'] for u in urls if not url_filter or u.get('url') == url_filter]
+            links = crawler.link_manager.all_links if crawler.link_manager else []
+            rows = NgramAnalyzer().aggregate(urls, links, selected, n)
+
+            if export_format == 'json':
+                return Response(
+                    json.dumps({'export_date': time.strftime('%Y-%m-%d %H:%M:%S'), 'ngrams': rows}),
+                    mimetype='application/json',
+                    headers={'Content-Disposition': f'attachment; filename=librecrawl_ngrams_{timestamp}.json'}
+                )
+            elif export_format == 'xml':
+                root = ET.Element('librecrawl_ngrams')
+                root.set('export_date', time.strftime('%Y-%m-%d %H:%M:%S'))
+                root.set('total_ngrams', str(len(rows)))
+                for row in rows:
+                    item = ET.SubElement(root, 'ngram')
+                    for field in NGRAM_EXPORT_FIELDS:
+                        value = ET.SubElement(item, field)
+                        value.text = str(row.get(field, ''))
+                return Response(
+                    ET.tostring(root, encoding='utf-8'),
+                    mimetype='application/xml',
+                    headers={'Content-Disposition': f'attachment; filename=librecrawl_ngrams_{timestamp}.xml'}
+                )
+            elif export_format == 'xlsx':
+                return Response(
+                    _build_xlsx(
+                        'N-Grams',
+                        NGRAM_EXPORT_FIELDS,
+                        ([row.get(f, '') for f in NGRAM_EXPORT_FIELDS] for row in rows)
+                    ),
+                    mimetype=XLSX_MIMETYPE,
+                    headers={'Content-Disposition': f'attachment; filename=librecrawl_ngrams_{timestamp}.xlsx'}
+                )
+            else:
+                output = StringIO()
+                writer = csv.DictWriter(output, fieldnames=NGRAM_EXPORT_FIELDS)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({f: row.get(f, '') for f in NGRAM_EXPORT_FIELDS})
+                return Response(
+                    output.getvalue(),
+                    mimetype='text/csv',
+                    headers={'Content-Disposition': f'attachment; filename=librecrawl_ngrams_{timestamp}.csv'}
+                )
+
         else:
             # URLs export
             urls = crawler.crawl_results
@@ -1429,6 +1792,9 @@ def export_stream():
             regular_fields = [f for f in export_fields if f not in ['issues_detected', 'links_detailed']]
             if not regular_fields:
                 return jsonify({'success': False, 'error': 'No fields selected'}), 400
+
+            urls, regular_fields = flatten_custom_extraction(
+                urls, regular_fields, join=export_format != 'json')
 
             if export_format == 'json':
                 return Response(
@@ -1828,6 +2194,8 @@ def export_data():
 
         # Generate regular export if there are regular fields
         if regular_fields:
+            urls, regular_fields = flatten_custom_extraction(
+                urls, regular_fields, join=export_format != 'json')
             if export_format == 'csv':
                 regular_content = generate_csv_export(urls, regular_fields)
                 regular_mimetype = 'text/csv'

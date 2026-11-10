@@ -10,7 +10,24 @@ A web-based multi-tenant crawler for SEO analysis and website auditing.
 
 **Browse plugins other people have built, or share your own, at the [Plugin Workshop](https://workshop.librecrawl.com)**.
 
-LibreCrawl will ***always*** be free and open source. If it's replacing your $279/year Screaming Frog license, deepcrawl license or sitebulb license, [buy me a coffee](https://www.paypal.com/donate/?business=7H9HFA3385JS8&no_recurring=0&item_name=Continue+the+development+of+LibreCrawl&currency_code=AUD).
+LibreCrawl will ***always*** be free and open source. It's built and maintained by one person, with no paid tier and no investors.
+
+### 💼 Using LibreCrawl at an agency or company?
+
+If LibreCrawl is replacing a $279/year Screaming Frog, Deepcrawl or Sitebulb license for each of your seats, please consider putting some of that budget toward the tool you're actually using. Sponsorship pays for new features, bug fixes and keeping the project alive.
+
+| Tier | Suggested | You get |
+|---|---|---|
+| ☕ Individual | Any amount | My thanks, and a faster LibreCrawl |
+| 🥈 Freelancer / small agency | $20/month | Your name in the Sponsors section below |
+| 🥇 Agency | $100/month | Your logo and link in the Sponsors section below |
+| 🏆 Enterprise | $500/month | Large logo at the top of this README, plus priority on your bug reports and feature requests |
+
+**[Become a sponsor on GitHub](https://github.com/sponsors/PhialsBasement)** (monthly or one-time, and companies can pay through their GitHub billing). You can also give through [PayPal](https://www.paypal.com/donate/?business=7H9HFA3385JS8&no_recurring=0&item_name=Continue+the+development+of+LibreCrawl&currency_code=AUD). Need an invoice for your accounts team? [Open an issue](https://github.com/PhialsBasement/LibreCrawl/issues) or contact me through [librecrawl.com](https://librecrawl.com).
+
+### ❤️ Sponsors
+
+*No sponsors yet. Your agency's logo could be first here.*
 
 ## What it does
 
@@ -27,31 +44,51 @@ LibreCrawl crawls websites and gives you detailed information about pages, links
 - 📈 **PageSpeed Insights integration** - Analyze Core Web Vitals
 - 💾 **Multiple export formats** - CSV, Excel (XLSX), JSON, or XML
 - 🔍 **Issue detection** - Automated SEO issue identification
+- 🧩 **N-gram analysis** - Phrase frequency across body text, headings, titles, and inlink anchor text, with a CSV export
 - ⚡ **Real-time crawling progress** with live statistics
 
 ## Getting started
 ### Quick Start (Automatic Installation)
 
-**The easiest way to run LibreCrawl** - just run the startup script and it handles everything:
+**The easiest way to run LibreCrawl.** The start script installs everything else and opens LibreCrawl in your browser. All you need first is **Python 3.11 or newer** (or Docker).
 
-**Windows:**
-```batch
-start-librecrawl.bat
-```
+The first start takes a few minutes, because it downloads LibreCrawl's packages and a Chromium browser (about 200 MB). Later starts are quick. Keep the window open while you use LibreCrawl, and close it (or press `Ctrl+C`) to stop.
 
-**Linux/Mac:**
+#### Windows
+
+1. Install Python from [python.org/downloads](https://www.python.org/downloads/) and run the installer.
+2. Download LibreCrawl: on this page click the green **Code** button, then **Download ZIP**, and unzip it.
+3. Open the unzipped `LibreCrawl-main` folder and double-click **`start-librecrawl.bat`**.
+
+#### Mac
+
+1. Install Python from [python.org/downloads](https://www.python.org/downloads/) (the macOS installer) and click through it.
+2. Download LibreCrawl: on this page click the green **Code** button, then **Download ZIP**. Double-click the ZIP in your Downloads folder to unzip it.
+3. Open **Terminal** (press `Cmd+Space`, type *Terminal*, press Enter).
+4. Type `cd ` (with a space after it), drag the unzipped `LibreCrawl-main` folder into the Terminal window, and press Enter.
+5. Paste these two lines and press Enter:
+   ```bash
+   chmod +x start-librecrawl.sh
+   ./start-librecrawl.sh
+   ```
+
+#### Linux
+
 ```bash
-chmod +x start-librecrawl.sh
+# Ubuntu/Debian: Python and its venv module
+sudo apt install python3 python3-venv git
+
+git clone https://github.com/PhialsBasement/LibreCrawl.git
+cd LibreCrawl
 ./start-librecrawl.sh
 ```
 
-**What it does automatically:**
-1. Checks for Docker - if found, runs LibreCrawl in a container (recommended)
-2. If no Docker, checks for Python - if not found, downloads and installs it (Windows only *temporairly disabled since it causes some bat issues*)
-3. Installs all dependencies automatically (`pip install -r requirements.txt`)
-4. Installs Playwright browsers for JavaScript rendering
-5. Starts LibreCrawl in local mode (no authentication)
-6. Opens your browser to `http://localhost:5000`
+**What the start script does:**
+1. If Docker (with Docker Compose) is installed and running, it runs LibreCrawl in a container. If Docker is installed but not running, it tells you to start it.
+2. Otherwise it uses Python 3.11+: it creates its own environment in `.venv` (so your system Python stays untouched), installs LibreCrawl's packages, and installs Chromium for JavaScript rendering.
+3. It starts LibreCrawl in local mode (no login) and opens `http://localhost:5000`.
+
+It checks the packages on every start, so updating LibreCrawl also brings in any new ones.
 
 ### Manual Installation
 
@@ -76,7 +113,7 @@ docker compose up -d
 
 # Open browser to http://localhost:5000
 ```
-By default, LibreCrawl runs in local mode for easy personal use. The `.env` file controls this:
+Docker starts in **standard mode** (accounts and login) unless you set `LOCAL_MODE=true`. The start scripts above use local mode. For personal use on your own machine, set this in `.env` to skip accounts entirely:
 
 ```bash
 # .env file
@@ -84,6 +121,8 @@ LOCAL_MODE=true
 HOST_BINDING=127.0.0.1
 REGISTRATION_DISABLED=false
 ```
+
+In standard mode without email (SMTP) set up, **the first account you register becomes the admin** and can log in straight away. Accounts registered after that need approving, see [Managing accounts](#managing-accounts).
 
 For production deployment with user authentication, edit your `.env` file:
 
@@ -113,21 +152,23 @@ See `.env.example` for what each option does.
 
 #### Option 2: Python
 
-- Python 3.8 or later
+- Python 3.11 or later
 - Modern web browser (Chrome, Firefox, Safari, Edge)
 
 ### Installation
 
 1. Clone or download this repository
 
-2. Install dependencies:
+2. Create a virtual environment and install dependencies (Homebrew and recent Linux Python refuse a system-wide `pip install`):
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+python -m pip install -r requirements.txt
 ```
 
 3. For JavaScript rendering support (optional):
 ```bash
-playwright install chromium
+python -m playwright install chromium
 ```
 
 4. Run the application:
@@ -283,6 +324,25 @@ Check out these example plugins to get started:
 - No rate limits or tier restrictions
 - Perfect for personal use or single-user self-hosting
 - Recommended for local development and testing
+
+### Managing accounts
+
+In standard mode, new accounts are verified by email when SMTP is configured (`SMTP_*` in `.env`). Without SMTP:
+
+- The **first account** registered on the server becomes the **admin** and can log in immediately. If you registered before this existed, just log in: an unverified account claims admin if the server has none yet.
+- Later accounts can't log in until the admin approves them.
+
+There's no admin page yet, so use `manage.py`:
+
+```bash
+python manage.py users                       # list accounts, verified status and tier
+python manage.py approve <username>          # let an account log in (tier "user")
+python manage.py approve <username> --tier extra
+python manage.py set-tier <username> admin   # guest, user, extra or admin
+
+# Docker
+docker compose exec librecrawl python manage.py users
+```
 
 ## Configuration
 

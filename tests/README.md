@@ -13,7 +13,7 @@ python tests/fixture_tests.py
 ```
 
 Prints a PASS/FAIL line per behaviour and exits non-zero if any fail. If ports
-8911-8923 are taken locally, set `FIXTURE_BASE_PORT` to move the range.
+8911-8926 are taken locally, set `FIXTURE_BASE_PORT` to move the range.
 
 Each test pins a bug that reached production once:
 
@@ -27,6 +27,13 @@ Each test pins a bug that reached production once:
 | `test_duplicate_detection_is_linear` | A site of templated pages holds the crawl in "finishing up" for minutes and produces two duplicate issues per matching pair (700k rows for 1,000 pages), locking the database while they save |
 | `test_export_formats_apply_to_every_data_type` | The format chosen in Settings is ignored for links/issues exports, or Excel silently produces CSV |
 | `test_crawl_delay_is_honoured` | The crawl delay setting is ignored with JavaScript rendering off, so sites get hit as fast as concurrency allows |
+| `test_list_mode_fetches_only_the_list` | List mode follows links, probes sitemaps, drops a listed URL, fetches a robots.txt-disallowed URL, or misses URLs on a second site |
+| `test_custom_extraction` | CSS/XPath extractors return wrong values, break on pages without matches, lose their per-extractor export columns, or save with an invalid selector |
+| `test_site_wide_analysis` | Indexability ignores X-Robots-Tag; duplicate title/meta/H1, redirect chains and loops, broken-link sources, canonical chains, inlinks, Link Score or the sitemap/orphan audit go wrong; analysis patches reach the UI before their rows |
+| `test_crawl_analysis_scales_linearly` | The end-of-crawl analysis turns quadratic on templated sites and holds a large crawl in "finishing up" |
+| `test_hostile_input_regressions` | One malformed `href`, `Location` or sitemap `<loc>` loses a whole page or the rest of the sitemap; 204 counts as indexable; a `javascript:` canonical marks a page canonicalised; equally linked pages score 0; a corrupt DB value empties a loaded crawl |
+| `test_canonicals_and_titles` | Repeated or conflicting canonicals (tags or `Link` headers) go unreported, conflicting ones still mark the page canonicalised, a header-only canonical is missed, or titles inside SVG/`<object>`/`<iframe>` count as page titles |
+| `test_analysis_persists_and_crawls_compare` | Analysis fields or the final `linked_from` are lost on reload, crawl comparison misreports changes or leaks another user's crawls, or a resumed crawl saves its end-of-crawl issues twice |
 
 ## crawl_harness.py
 
